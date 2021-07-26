@@ -2,12 +2,16 @@ package allocrunner
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/hashicorp/go-cleanhttp"
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad/client/allocdir"
 	"github.com/hashicorp/nomad/client/allocrunner/interfaces"
@@ -173,13 +177,78 @@ func (p *httpSocketProxy) run(alloc *structs.Allocation) error {
 	}
 
 	go func() {
-		proxy(p.ctx, p.logger, destAddr, listener)
+		proxyHTTP(p.ctx, p.logger, destAddr, listener)
 		p.cancel()
 		close(p.doneCh)
 	}()
 
 	p.runOnce = true
 	return nil
+}
+
+func forward(r *http.Request, host string) *http.Request {
+	var hop = []string{
+		"Connection",
+		"Keep-Alive",
+		"Proxy-Authenticate",
+		"Proxy-Authorization",
+		"Te",
+		"Trailers",
+		"Transfer-Encoding",
+		"Upgrade",
+	}
+
+	r2 := r.Clone(context.Background())
+
+	// remove this thing from first request
+	r2.RequestURI = ""
+
+	// set url for forward address
+
+	// environment variable?
+
+	r2.URL.Scheme = "http" // what if https?
+	r2.URL.Host = host
+
+	// remove headers set during first request
+	for _, header := range hop {
+		r2.Header.Del(header)
+	}
+
+	// append forward header chain
+	if prior := r2.Header.Get("X-Forwarded-For"); prior != "" {
+		host = prior + ", " + host
+	}
+	r2.Header.Set("X-Forwarded-For", host)
+
+	// return our copy
+	return r2
+}
+
+func proxyHTTP(ctx context.Context, logger hclog.Logger, destAddr string, l net.Listener) {
+	httpClient := cleanhttp.DefaultClient()
+
+	if err := (&http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r2 := forward(r, destAddr)
+			fmt.Println("r2:", r2)
+
+			resp, err := httpClient.Do(r2)
+			if err != nil {
+				fmt.Println("do error:", err)
+				return
+			}
+			defer resp.Body.Close()
+
+			for k, v := range resp.Header {
+				w.Header()[k] = v
+			}
+			w.WriteHeader(resp.StatusCode)
+			_, _ = io.Copy(w, resp.Body)
+		}),
+	}).Serve(l); err != nil {
+		fmt.Println("pH serve err:", err)
+	}
 }
 
 func (p *httpSocketProxy) stop() error {
